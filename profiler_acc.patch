@@ -1,0 +1,149 @@
+From 262acaffe62e0c18a9e0cc66e312f246997aff99 Mon Sep 17 00:00:00 2001
+From: xxx <xxx@xxx.com>
+Date: Thu, 30 Jul 2026 20:38:10 +0800
+Subject: [PATCH] add cost output
+
+---
+ include/flashinfer/attention/scheduler.cuh | 76 +++++++++++++++++++++-
+ 1 file changed, 73 insertions(+), 3 deletions(-)
+
+diff --git a/include/flashinfer/attention/scheduler.cuh b/include/flashinfer/attention/scheduler.cuh
+index cc524d71..1ffe29f6 100644
+--- a/include/flashinfer/attention/scheduler.cuh
++++ b/include/flashinfer/attention/scheduler.cuh
+@@ -1409,9 +1409,16 @@ struct LoadPlanInfo {
+   bool split_kv = false;
+   bool decode_plan = true; // true: MWSD, false: MWMD
+   int64_t kv_chunk_offset;
++  // ========== Cost Stats (host-side diagnostics, scaled by 10000) ==========
++  int64_t sm_cost_min = 0;
++  int64_t sm_cost_max = 0;
++  int64_t sm_cost_avg = 0;
++  int64_t cta_cost_min = 0;
++  int64_t cta_cost_max = 0;
++  int64_t cta_cost_avg = 0;
+ 
+   static constexpr uint32_t NUM_TASK_ARGS = 2;
+-  static constexpr uint32_t NUM_SHARED_ARGS = 12;
++  static constexpr uint32_t NUM_SHARED_ARGS = 18;
+ 
+   std::vector<int64_t> ToVector() const {
+     std::vector<int64_t> vec;
+@@ -1431,14 +1438,24 @@ struct LoadPlanInfo {
+     vec.push_back(split_kv);
+     vec.push_back(decode_plan);
+     vec.push_back(kv_chunk_offset);
++    vec.push_back(sm_cost_min);
++    vec.push_back(sm_cost_max);
++    vec.push_back(sm_cost_avg);
++    vec.push_back(cta_cost_min);
++    vec.push_back(cta_cost_max);
++    vec.push_back(cta_cost_avg);
+     return vec;
+   }
+ 
+   void FromVector(const std::vector<int64_t>& vec) {
+-    if (vec.size() != NUM_SHARED_ARGS + NUM_TASKS * NUM_TASK_ARGS) {
++    constexpr uint32_t OLD_NUM_SHARED_ARGS = 12;
++    constexpr uint32_t expected_size = NUM_SHARED_ARGS + NUM_TASKS * NUM_TASK_ARGS;
++    constexpr uint32_t old_expected_size = OLD_NUM_SHARED_ARGS + NUM_TASKS * NUM_TASK_ARGS;
++    if (vec.size() != expected_size && vec.size() != old_expected_size) {
+       std::ostringstream err_msg;
+       err_msg << "LoadPlanInfo::FromVector: vec.size() should be "
+-              << NUM_SHARED_ARGS + NUM_TASKS * NUM_TASK_ARGS << ", but got " << vec.size();
++              << expected_size << " (or " << old_expected_size << " for old format)"
++              << ", but got " << vec.size();
+       FLASHINFER_ERROR(err_msg.str());
+     }
+     num_blks_x = vec[0];
+@@ -1457,6 +1474,15 @@ struct LoadPlanInfo {
+     split_kv = vec[9 + NUM_TASKS * NUM_TASK_ARGS];
+     decode_plan = vec[10 + NUM_TASKS * NUM_TASK_ARGS];
+     kv_chunk_offset = vec[11 + NUM_TASKS * NUM_TASK_ARGS];
++    // new fields: only read if vec is long enough (backward compat)
++    if (vec.size() >= 18 + NUM_TASKS * NUM_TASK_ARGS) {
++      sm_cost_min  = vec[12 + NUM_TASKS * NUM_TASK_ARGS];
++      sm_cost_max  = vec[13 + NUM_TASKS * NUM_TASK_ARGS];
++      sm_cost_avg  = vec[14 + NUM_TASKS * NUM_TASK_ARGS];
++      cta_cost_min = vec[15 + NUM_TASKS * NUM_TASK_ARGS];
++      cta_cost_max = vec[16 + NUM_TASKS * NUM_TASK_ARGS];
++      cta_cost_avg = vec[17 + NUM_TASKS * NUM_TASK_ARGS];
++    }
+   }
+ };
+ #if 0
+@@ -2335,6 +2361,27 @@ inline cudaError_t MultiLevelLoadPlan(void* float_buffer, size_t float_workspace
+     sm_work_list[sm_idx][work.task_type].push_back(work_idx);
+   }
+ 
++  // ========== SM-Level Cost Stats ==========
++  {
++    auto heap_data = sm_cost_heap.getHeap();
++    size_t n = heap_data.size();
++    if (n > 0) {
++      float min_cost = std::numeric_limits<float>::max();
++      float max_cost = 0.0f;
++      double sum_cost = 0.0;
++      for (auto& kv : heap_data) {
++        float cost = kv.second;
++        min_cost = std::min(min_cost, cost);
++        max_cost = std::max(max_cost, cost);
++        sum_cost += cost;
++      }
++      float avg_cost = static_cast<float>(sum_cost / n);
++      plan_info.sm_cost_min = static_cast<int64_t>(std::round(min_cost * 10000.0f));
++      plan_info.sm_cost_max = static_cast<int64_t>(std::round(max_cost * 10000.0f));
++      plan_info.sm_cost_avg = static_cast<int64_t>(std::round(avg_cost * 10000.0f));
++    }
++  }
++
+   // Step 4: CTA-level Scheduling(Fusion)
+ 
+   // order:(bs, head, split, tile)
+@@ -2360,6 +2407,7 @@ inline cudaError_t MultiLevelLoadPlan(void* float_buffer, size_t float_workspace
+   ); // (cta_idx, task, work)
+ 
+   std::vector<std::vector<uint8_t>> task_select(num_ctas, std::vector<uint8_t>()); // (cta_idx, task_type)
++  std::vector<float> cta_costs_per_sm(num_sm, 0.0f);
+   for (uint32_t sm_idx = 0; sm_idx < num_sm; ++sm_idx) {
+     int num_pd_task[NUM_TASKS] = {sm_work_list[sm_idx][0].size(), sm_work_list[sm_idx][1].size()};
+     if (num_pd_task[0] == 0 && num_pd_task[1] == 0)
+@@ -2406,6 +2454,9 @@ inline cudaError_t MultiLevelLoadPlan(void* float_buffer, size_t float_workspace
+       pd_idx[task_type]++;
+     }
+ 
++    // collect CTA-level cost for this SM
++    cta_costs_per_sm[sm_idx] = std::max(slot_cost[0], slot_cost[1]);
++
+     #else
+     // not support d=256 now
+     // construct a vector to record prefill CTA(or slot) cost and decode
+@@ -2468,6 +2519,25 @@ inline cudaError_t MultiLevelLoadPlan(void* float_buffer, size_t float_workspace
+       //    sm_idx, sm_idx, num_pd_task[0] + num_pd_task[1], (unsigned)task_select[sm_idx * num_slot + (num_pd_task[0] > 0 ? 0 : 1)][0]);
+     }
+   }
++
++  // ========== CTA-Level Cost Stats ==========
++  {
++    size_t n = cta_costs_per_sm.size();
++    float min_cost = std::numeric_limits<float>::max();
++    float max_cost = 0.0f;
++    double sum_cost = 0.0;
++    for (size_t i = 0; i < n; ++i) {
++      float cost = cta_costs_per_sm[i];
++      min_cost = std::min(min_cost, cost);
++      max_cost = std::max(max_cost, cost);
++      sum_cost += cost;
++    }
++    float avg_cost = static_cast<float>(sum_cost / n);
++    plan_info.cta_cost_min = static_cast<int64_t>(std::round(min_cost * 10000.0f));
++    plan_info.cta_cost_max = static_cast<int64_t>(std::round(max_cost * 10000.0f));
++    plan_info.cta_cost_avg = static_cast<int64_t>(std::round(avg_cost * 10000.0f));
++  }
++
+   // exit(0);
+   // Step 5: Warp-Level Tile Scheduling
+   // if 4 continous decode tiles widely exist and load-balance metric < threshold
+-- 
+2.34.1
+
